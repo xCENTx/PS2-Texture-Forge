@@ -2,6 +2,8 @@ from pathlib import Path
 import subprocess
 import time
 import sys
+import os
+from datetime import datetime, timedelta
 
 
 # ============================================================================
@@ -10,20 +12,18 @@ import sys
 #
 # Watches a PCSX2 texture dump directory for newly dumped textures.
 #
-# When a new texture is detected:
-#
-#     PCSX2 dumps texture
-#            ↓
-#     Texture Forge detects it
-#            ↓
-#     Real-ESRGAN upscales it
-#            ↓
-#     Replacement is written using the SAME filename
-#            ↓
-#     PCSX2 can load the HD replacement
+# PCSX2 dump
+#      ↓
+# Texture Forge detects texture
+#      ↓
+# Real-ESRGAN upscales texture
+#      ↓
+# Same filename written to replacements/
+#      ↓
+# PCSX2 loads HD replacement
 #
 #
-# Expected directory structure:
+# Expected structure:
 #
 #   PCSX2/
 #       textures/
@@ -43,26 +43,22 @@ import sys
 # CONFIG
 # ============================================================================
 
-# PCSX2 game serial / texture directory.
 GAME_TITLE = "SCUS-97134"
 
-# Real-ESRGAN upscale factor.
 SCALE = 4
 
-# Real-ESRGAN model.
 MODEL = "realesrgan-x4plus"
 
-# How frequently we scan for newly dumped textures.
 POLL_INTERVAL = 0.25
 
-# How frequently we check whether PCSX2 finished writing a file.
+DASHBOARD_REFRESH_INTERVAL = 1.0
+
 FILE_READY_INTERVAL = 0.05
 
-# Number of identical file-size checks required before considering a dump
-# finished.
 FILE_READY_CHECKS = 3
 
-# Supported dump formats.
+PROGRESS_BAR_WIDTH = 40
+
 SUPPORTED_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -76,61 +72,83 @@ SUPPORTED_EXTENSIONS = {
 # PATHS
 # ============================================================================
 
-# Directory containing this script:
-#
-#   ...\PCSX2\textures\PCSX2-Texture-Forge
-#
+# ...\PCSX2\textures\PCSX2-Texture-Forge
 TOOL_DIR = Path(__file__).resolve().parent
 
-
-# Parent directory:
-#
-#   ...\PCSX2\textures
-#
+# ...\PCSX2\textures
 TEXTURES_DIR = TOOL_DIR.parent
 
-
-# Game texture directory:
-#
-#   ...\PCSX2\textures\SCUS-97134
-#
+# ...\PCSX2\textures\SCUS-97134
 GAME_DIR = TEXTURES_DIR / GAME_TITLE
 
-
-# PCSX2 directories.
 DUMPS_DIR = GAME_DIR / "dumps"
+
 REPLACEMENTS_DIR = GAME_DIR / "replacements"
 
-
-# Real-ESRGAN executable.
 REALESRGAN_EXE = TOOL_DIR / "realesrgan-ncnn-vulkan.exe"
+
+
+# ============================================================================
+# SESSION STATE
+# ============================================================================
+
+SESSION_START_TIME = time.time()
+
+PROCESSING_TIMES = []
+
+SESSION_PROCESSED = 0
+
+SESSION_FAILED = 0
+
+LAST_COMPLETED = None
+
+LAST_PROCESSING_TIME = None
+
+CURRENT_TEXTURE = None
+
+CURRENT_STATUS = "Starting"
+
+LAST_DASHBOARD_REFRESH = 0.0
+
+
+# ============================================================================
+# TIME FORMATTING
+# ============================================================================
+
+def format_duration(seconds):
+    """
+    Convert seconds into HH:MM:SS or MM:SS.
+    """
+
+    seconds = max(0, int(seconds))
+
+    hours, remainder = divmod(seconds, 3600)
+
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def get_elapsed_time():
+
+    return time.time() - SESSION_START_TIME
 
 
 # ============================================================================
 # CONSOLE
 # ============================================================================
 
-def print_header():
-    print()
-    print("============================================================")
-    print("                    PCSX2 TEXTURE FORGE")
-    print("============================================================")
-    print()
-    print(f" Game:          {GAME_TITLE}")
-    print(f" Scale:         {SCALE}x")
-    print(f" Model:         {MODEL}")
-    print()
-    print(f" Tool:")
-    print(f"   {TOOL_DIR}")
-    print()
-    print(f" Dumps:")
-    print(f"   {DUMPS_DIR}")
-    print()
-    print(f" Replacements:")
-    print(f"   {REPLACEMENTS_DIR}")
-    print()
-    print("============================================================")
-    print()
+def clear_console():
+    """
+    Clear the console so the dashboard remains stationary.
+    """
+
+    os.system(
+        "cls" if os.name == "nt" else "clear"
+    )
 
 
 # ============================================================================
@@ -138,17 +156,24 @@ def print_header():
 # ============================================================================
 
 def validate_environment():
-    """
-    Make sure Real-ESRGAN exists and create the required PCSX2 directories.
-    """
 
     if not REALESRGAN_EXE.exists():
+
+        clear_console()
+
+        print("==============================================================")
+        print("                     PCSX2 TEXTURE FORGE")
+        print("==============================================================")
+        print()
         print("[ERROR] Real-ESRGAN executable was not found.")
         print()
         print("Expected:")
+        print()
         print(f"  {REALESRGAN_EXE}")
         print()
+
         return False
+
 
     DUMPS_DIR.mkdir(
         parents=True,
@@ -169,112 +194,666 @@ def validate_environment():
 
 def wait_for_file(file: Path):
     """
-    Wait for PCSX2 to finish writing a dumped texture.
-
-    A file is considered ready after its size remains unchanged for several
-    consecutive checks.
+    Wait until PCSX2 appears to have finished writing the texture.
     """
 
     previous_size = -1
+
     stable_checks = 0
+
 
     while stable_checks < FILE_READY_CHECKS:
 
         try:
+
             current_size = file.stat().st_size
 
         except FileNotFoundError:
+
             return False
 
-        # Empty file isn't ready.
+
         if current_size <= 0:
+
             stable_checks = 0
 
         elif current_size == previous_size:
+
             stable_checks += 1
 
         else:
+
             stable_checks = 0
+
 
         previous_size = current_size
 
-        time.sleep(FILE_READY_INTERVAL)
+        time.sleep(
+            FILE_READY_INTERVAL
+        )
+
 
     return True
+
+
+# ============================================================================
+# TEXTURE PATHS
+# ============================================================================
+
+def get_output_file(input_file: Path):
+    """
+    Return the corresponding replacement path for a dump.
+    """
+
+    relative_path = input_file.relative_to(
+        DUMPS_DIR
+    )
+
+    relative_path = relative_path.with_suffix(
+        ".png"
+    )
+
+    return REPLACEMENTS_DIR / relative_path
+
+
+# ============================================================================
+# FIND TEXTURES
+# ============================================================================
+
+def find_dumped_textures():
+
+    textures = []
+
+    if not DUMPS_DIR.exists():
+        return textures
+
+
+    for file in DUMPS_DIR.rglob("*"):
+
+        if not file.is_file():
+            continue
+
+        if file.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+
+        textures.append(file)
+
+
+    return textures
+
+
+# ============================================================================
+# STATISTICS
+# ============================================================================
+
+def get_statistics():
+
+    textures = find_dumped_textures()
+
+    total = len(textures)
+
+    completed = 0
+
+
+    for texture in textures:
+
+        output_file = get_output_file(
+            texture
+        )
+
+        if output_file.exists():
+            completed += 1
+
+
+    remaining = max(
+        0,
+        total - completed
+    )
+
+
+    return (
+        total,
+        completed,
+        remaining
+    )
+
+
+# ============================================================================
+# ETA
+# ============================================================================
+
+def get_eta(remaining):
+
+    if remaining <= 0:
+
+        if PROCESSING_TIMES:
+
+            average_time = (
+                sum(PROCESSING_TIMES)
+                / len(PROCESSING_TIMES)
+            )
+
+            average_string = (
+                f"{average_time:.2f}s"
+            )
+
+        else:
+
+            average_string = "--"
+
+
+        return (
+            average_string,
+            "Complete",
+            "Complete"
+        )
+
+
+    if not PROCESSING_TIMES:
+
+        return (
+            "--",
+            "Calculating...",
+            "Calculating..."
+        )
+
+
+    average_time = (
+        sum(PROCESSING_TIMES)
+        / len(PROCESSING_TIMES)
+    )
+
+
+    estimated_seconds_remaining = (
+        average_time * remaining
+    )
+
+
+    estimated_finish = (
+        datetime.now()
+        + timedelta(
+            seconds=estimated_seconds_remaining
+        )
+    )
+
+
+    average_string = (
+        f"{average_time:.2f}s"
+    )
+
+    eta_string = format_duration(
+        estimated_seconds_remaining
+    )
+
+    finish_string = estimated_finish.strftime(
+        "%I:%M:%S %p"
+    )
+
+
+    return (
+        average_string,
+        eta_string,
+        finish_string
+    )
+
+
+# ============================================================================
+# DASHBOARD
+# ============================================================================
+
+def draw_dashboard(
+    force=False
+):
+    """
+    Draw the complete dashboard.
+
+    While idle, redraws are rate limited.
+
+    Texture start/completion events use force=True so the display updates
+    immediately.
+    """
+
+    global LAST_DASHBOARD_REFRESH
+
+
+    now = time.time()
+
+
+    # ------------------------------------------------------------------------
+    # Rate limit idle dashboard refreshes
+    # ------------------------------------------------------------------------
+
+    if not force:
+
+        if (
+            now - LAST_DASHBOARD_REFRESH
+            < DASHBOARD_REFRESH_INTERVAL
+        ):
+
+            return
+
+
+    LAST_DASHBOARD_REFRESH = now
+
+
+    # ------------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------------
+
+    total, completed, remaining = (
+        get_statistics()
+    )
+
+
+    if total > 0:
+
+        percentage = (
+            completed / total
+        )
+
+    else:
+
+        percentage = 0.0
+
+
+    filled = int(
+        PROGRESS_BAR_WIDTH
+        * percentage
+    )
+
+
+    filled = min(
+        PROGRESS_BAR_WIDTH,
+        max(
+            0,
+            filled
+        )
+    )
+
+
+    bar = (
+        "#" * filled
+        + "-"
+        * (
+            PROGRESS_BAR_WIDTH
+            - filled
+        )
+    )
+
+
+    # ------------------------------------------------------------------------
+    # Time
+    # ------------------------------------------------------------------------
+
+    elapsed = get_elapsed_time()
+
+
+    (
+        average_string,
+        eta_string,
+        finish_string
+
+    ) = get_eta(
+        remaining
+    )
+
+
+    # ------------------------------------------------------------------------
+    # Draw
+    # ------------------------------------------------------------------------
+
+    clear_console()
+
+
+    print(
+        "=============================================================="
+    )
+
+    print(
+        "                     PCSX2 TEXTURE FORGE"
+    )
+
+    print(
+        "=============================================================="
+    )
+
+    print()
+
+
+    print(
+        f" Game:           {GAME_TITLE}"
+    )
+
+    print(
+        f" Model:          {MODEL}"
+    )
+
+    print(
+        f" Scale:          {SCALE}x"
+    )
+
+
+    print()
+
+
+    print(
+        f" [{bar}] "
+        f"{percentage * 100:6.2f}%"
+    )
+
+
+    print()
+
+
+    print(
+        f" Textures:       "
+        f"{completed:>6,} / {total:,}"
+    )
+
+    print(
+        f" Remaining:      "
+        f"{remaining:>6,}"
+    )
+
+    print(
+        f" This Session:   "
+        f"{SESSION_PROCESSED:>6,}"
+    )
+
+    print(
+        f" Failed:         "
+        f"{SESSION_FAILED:>6,}"
+    )
+
+
+    print()
+
+
+    print(
+        f" Work Time:      "
+        f"{format_duration(elapsed)}"
+    )
+
+    print(
+        f" Avg / Texture:  "
+        f"{average_string}"
+    )
+
+    print(
+        f" ETA:            "
+        f"{eta_string}"
+    )
+
+    print(
+        f" Finish:         "
+        f"{finish_string}"
+    )
+
+
+    print()
+
+
+    print(
+        f" Status:         "
+        f"{CURRENT_STATUS}"
+    )
+
+
+    print()
+
+
+    print(
+        " Current Texture:"
+    )
+
+
+    if CURRENT_TEXTURE is not None:
+
+        print(
+            f"   {CURRENT_TEXTURE.name}"
+        )
+
+    else:
+
+        print(
+            "   --"
+        )
+
+
+    print()
+
+
+    print(
+        " Last Completed:"
+    )
+
+
+    if LAST_COMPLETED is not None:
+
+        if LAST_PROCESSING_TIME is not None:
+
+            print(
+                f"   {LAST_COMPLETED.name}"
+            )
+
+            print(
+                f"   Processing Time: "
+                f"{LAST_PROCESSING_TIME:.2f}s"
+            )
+
+        else:
+
+            print(
+                f"   {LAST_COMPLETED.name}"
+            )
+
+    else:
+
+        print(
+            "   --"
+        )
+
+
+    print()
+
+
+    print(
+        "=============================================================="
+    )
+
+    print(
+        " Ctrl+C to stop"
+    )
 
 
 # ============================================================================
 # REAL-ESRGAN
 # ============================================================================
 
-def upscale_texture(input_file: Path, output_file: Path):
-    """
-    Upscale one texture using Real-ESRGAN.
-    """
+def upscale_texture(
+    input_file: Path,
+    output_file: Path
+):
+
+    global SESSION_PROCESSED
+    global SESSION_FAILED
+
+    global LAST_COMPLETED
+    global LAST_PROCESSING_TIME
+
+    global CURRENT_TEXTURE
+    global CURRENT_STATUS
+
 
     output_file.parent.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    print(f"[NEW] {input_file.name}")
+
+    # ------------------------------------------------------------------------
+    # Start
+    # ------------------------------------------------------------------------
+
+    CURRENT_TEXTURE = input_file
+
+    CURRENT_STATUS = "UPSCALING"
+
+
+    draw_dashboard(
+        force=True
+    )
+
 
     command = [
-        str(REALESRGAN_EXE),
+
+        str(
+            REALESRGAN_EXE
+        ),
 
         "-i",
-        str(input_file),
+        str(
+            input_file
+        ),
 
         "-o",
-        str(output_file),
+        str(
+            output_file
+        ),
 
         "-n",
         MODEL,
 
         "-s",
-        str(SCALE),
+        str(
+            SCALE
+        ),
 
         "-f",
         "png",
     ]
 
+
+    start_time = time.time()
+
+
+    # ------------------------------------------------------------------------
+    # Run Real-ESRGAN
+    # ------------------------------------------------------------------------
+
     try:
+
         result = subprocess.run(
+
             command,
+
             cwd=TOOL_DIR,
+
             stdout=subprocess.DEVNULL,
+
             stderr=subprocess.PIPE,
+
             text=True,
+
             check=False
         )
 
-    except Exception as error:
-        print(f"[ERROR] Failed to start Real-ESRGAN:")
-        print(f"        {error}")
-        print()
+
+    except Exception:
+
+        SESSION_FAILED += 1
+
+        CURRENT_STATUS = "ERROR"
+
+        CURRENT_TEXTURE = None
+
+
+        draw_dashboard(
+            force=True
+        )
+
 
         return False
+
+
+    processing_time = (
+        time.time()
+        - start_time
+    )
+
+
+    # ------------------------------------------------------------------------
+    # Real-ESRGAN failure
+    # ------------------------------------------------------------------------
 
     if result.returncode != 0:
 
-        print(f"[FAIL] {input_file.name}")
+        SESSION_FAILED += 1
 
-        if result.stderr:
-            print(result.stderr.strip())
+        CURRENT_STATUS = "FAILED"
 
-        print()
+        CURRENT_TEXTURE = None
+
+
+        draw_dashboard(
+            force=True
+        )
+
 
         return False
+
+
+    # ------------------------------------------------------------------------
+    # Output missing
+    # ------------------------------------------------------------------------
 
     if not output_file.exists():
-        print(f"[FAIL] Real-ESRGAN returned successfully but no output exists:")
-        print(f"       {output_file}")
-        print()
+
+        SESSION_FAILED += 1
+
+        CURRENT_STATUS = "OUTPUT ERROR"
+
+        CURRENT_TEXTURE = None
+
+
+        draw_dashboard(
+            force=True
+        )
+
 
         return False
 
-    print(f"[ OK ] {input_file.name}")
-    print()
+
+    # ------------------------------------------------------------------------
+    # Success
+    # ------------------------------------------------------------------------
+
+    PROCESSING_TIMES.append(
+        processing_time
+    )
+
+
+    SESSION_PROCESSED += 1
+
+
+    LAST_COMPLETED = input_file
+
+    LAST_PROCESSING_TIME = (
+        processing_time
+    )
+
+
+    CURRENT_TEXTURE = None
+
+    CURRENT_STATUS = (
+        "PROCESSING QUEUE"
+    )
+
+
+    draw_dashboard(
+        force=True
+    )
+
 
     return True
 
@@ -283,28 +862,17 @@ def upscale_texture(input_file: Path, output_file: Path):
 # PROCESS TEXTURE
 # ============================================================================
 
-def process_texture(input_file: Path):
-    """
-    Process a single PCSX2 texture dump.
-    """
+def process_texture(
+    input_file: Path
+):
 
-    # Preserve the relative path underneath dumps.
-    #
-    # Example:
-    #
-    # dumps\foo\texture.png
-    #
-    # becomes:
-    #
-    # replacements\foo\texture.png
-    #
+    global CURRENT_TEXTURE
+    global CURRENT_STATUS
 
-    relative_path = input_file.relative_to(DUMPS_DIR)
 
-    # Real-ESRGAN outputs PNG.
-    relative_path = relative_path.with_suffix(".png")
-
-    output_file = REPLACEMENTS_DIR / relative_path
+    output_file = get_output_file(
+        input_file
+    )
 
 
     # ------------------------------------------------------------------------
@@ -312,15 +880,42 @@ def process_texture(input_file: Path):
     # ------------------------------------------------------------------------
 
     if output_file.exists():
+
         return False
 
 
     # ------------------------------------------------------------------------
-    # Wait for PCSX2 to finish writing
+    # Wait for PCSX2
     # ------------------------------------------------------------------------
 
-    if not wait_for_file(input_file):
-        print(f"[SKIP] File disappeared: {input_file.name}")
+    CURRENT_TEXTURE = input_file
+
+    CURRENT_STATUS = (
+        "WAITING FOR FILE"
+    )
+
+
+    draw_dashboard(
+        force=True
+    )
+
+
+    if not wait_for_file(
+        input_file
+    ):
+
+        CURRENT_TEXTURE = None
+
+        CURRENT_STATUS = (
+            "FILE DISAPPEARED"
+        )
+
+
+        draw_dashboard(
+            force=True
+        )
+
+
         return False
 
 
@@ -335,71 +930,86 @@ def process_texture(input_file: Path):
 
 
 # ============================================================================
-# FIND TEXTURES
-# ============================================================================
-
-def find_dumped_textures():
-    """
-    Recursively find supported texture dumps.
-    """
-
-    textures = []
-
-    if not DUMPS_DIR.exists():
-        return textures
-
-    for file in DUMPS_DIR.rglob("*"):
-
-        if not file.is_file():
-            continue
-
-        if file.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-
-        textures.append(file)
-
-    return textures
-
-
-# ============================================================================
 # INITIAL SCAN
 # ============================================================================
 
 def initial_scan():
-    """
-    Process textures that PCSX2 dumped before Texture Forge was started.
-    """
 
-    textures = find_dumped_textures()
+    global CURRENT_STATUS
 
-    if not textures:
-        print("[INFO] No existing texture dumps found.")
-        print()
-        return
+
+    CURRENT_STATUS = (
+        "SCANNING"
+    )
+
+
+    draw_dashboard(
+        force=True
+    )
+
+
+    textures = (
+        find_dumped_textures()
+    )
+
 
     pending = []
 
+
     for file in textures:
 
-        relative_path = file.relative_to(DUMPS_DIR)
         output_file = (
-            REPLACEMENTS_DIR /
-            relative_path.with_suffix(".png")
+            get_output_file(
+                file
+            )
         )
 
+
         if not output_file.exists():
-            pending.append(file)
+
+            pending.append(
+                file
+            )
 
 
-    print(
-        f"[INFO] Found {len(textures)} dumped texture(s), "
-        f"{len(pending)} pending."
+    # ------------------------------------------------------------------------
+    # Nothing pending
+    # ------------------------------------------------------------------------
+
+    if not pending:
+
+        CURRENT_STATUS = (
+            "UP TO DATE"
+        )
+
+
+        draw_dashboard(
+            force=True
+        )
+
+
+        return
+
+
+    # ------------------------------------------------------------------------
+    # Process queue
+    # ------------------------------------------------------------------------
+
+    CURRENT_STATUS = (
+        "PROCESSING QUEUE"
     )
 
-    print()
+
+    draw_dashboard(
+        force=True
+    )
+
 
     for file in pending:
-        process_texture(file)
+
+        process_texture(
+            file
+        )
 
 
 # ============================================================================
@@ -407,37 +1017,79 @@ def initial_scan():
 # ============================================================================
 
 def watch():
-    """
-    Continuously watch PCSX2's dump directory.
-    """
 
-    print("[WATCHING]")
-    print("Waiting for new PCSX2 texture dumps...")
-    print()
-    print("Press Ctrl+C to stop Texture Forge.")
-    print()
+    global CURRENT_STATUS
+    global CURRENT_TEXTURE
 
-    # We only use this to prevent repeatedly examining the same file during
-    # this execution.
-    #
-    # Existing replacements are independently checked by process_texture().
 
-    known_files = set(find_dumped_textures())
+    CURRENT_STATUS = (
+        "WATCHING"
+    )
+
+    CURRENT_TEXTURE = None
+
+
+    draw_dashboard(
+        force=True
+    )
+
+
+    known_files = set(
+        find_dumped_textures()
+    )
+
 
     while True:
 
-        textures = find_dumped_textures()
+        textures = (
+            find_dumped_textures()
+        )
+
+
+        found_new_texture = False
+
 
         for file in textures:
 
             if file in known_files:
+
                 continue
 
-            known_files.add(file)
 
-            process_texture(file)
+            known_files.add(
+                file
+            )
 
-        time.sleep(POLL_INTERVAL)
+
+            found_new_texture = True
+
+
+            process_texture(
+                file
+            )
+
+
+        # --------------------------------------------------------------------
+        # Idle / watching
+        # --------------------------------------------------------------------
+
+        if not found_new_texture:
+
+            CURRENT_STATUS = (
+                "WATCHING"
+            )
+
+            CURRENT_TEXTURE = None
+
+
+            draw_dashboard(
+                force=False
+            )
+
+
+        time.sleep(
+            POLL_INTERVAL
+        )
 
 
 # ============================================================================
@@ -446,24 +1098,24 @@ def watch():
 
 def main():
 
-    print_header()
-
     if not validate_environment():
+
         return 1
 
 
     # ------------------------------------------------------------------------
-    # Process anything PCSX2 already dumped.
+    # Existing dumps
     # ------------------------------------------------------------------------
 
     initial_scan()
 
 
     # ------------------------------------------------------------------------
-    # Watch for new dumps.
+    # Watch PCSX2
     # ------------------------------------------------------------------------
 
     watch()
+
 
     return 0
 
@@ -475,14 +1127,29 @@ def main():
 if __name__ == "__main__":
 
     try:
-        sys.exit(main())
+
+        sys.exit(
+            main()
+        )
+
 
     except KeyboardInterrupt:
+
+        CURRENT_STATUS = "STOPPED"
+
+        CURRENT_TEXTURE = None
+
+
+        draw_dashboard(
+            force=True
+        )
+
+
         print()
+        print(
+            "Texture Forge stopped."
+        )
         print()
-        print("============================================================")
-        print(" Texture Forge stopped.")
-        print("============================================================")
-        print()
+
 
         sys.exit(0)
