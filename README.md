@@ -1,5 +1,7 @@
 # PS2 Texture Forge
 
+<img width="510" height="531" alt="image" src="https://github.com/user-attachments/assets/c55fed25-6452-4f76-814f-34807ac3580e" />
+
 An automated AI texture upscaling tool for PCSX2.
 
 PS2 Texture Forge watches a PCSX2 texture dump directory, detects newly dumped textures, upscales them using Real-ESRGAN, and automatically places the resulting textures into the game's replacement directory.
